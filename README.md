@@ -14,7 +14,7 @@ A collection of tools, potentially packaged within a container image used by an 
     *   **Status monitoring:** Tools to check the health and status of the Kubelet service.
     *   **Log analysis:**  Scripts to collect and analyze Kubelet logs for debugging.
 *   **Containerd:**  Tools related to containerd, the container runtime used by Kubelet to manage containers. This might include:
-    *   **Container image management:** Tools for pulling, inspecting, or managing container images on nodes.
+    *   **Container image management:** Tools for pulling,cl inspecting, or managing container images on nodes.
     *   **Container lifecycle management:** Utilities to interact with containerd for container creation, deletion, and status checks.
     *   **Snapshotter management:** Tools to manage containerd snapshotter for efficient storage.
 *   **Sysctl:** Tools for managing and configuring sysctl parameters on Kubernetes nodes. Sysctl allows you to modify kernel parameters at runtime. These tools could help with:
@@ -89,7 +89,7 @@ spec:
       containers:
       - name: pause-container
         # Minimal container just to keep the Pod running after init succeeds
-        image: us.gcr.io/gke-release/pause:latest
+        image: gcr.io/gke-release/pause:latest
   updateStrategy:
     type: RollingUpdate
 ```
@@ -119,13 +119,18 @@ spec:
 
 ### Part 2: Taint -> Configure with Init Container -> Untaint Workflow
 
-This scenario demonstrates using taints to temporarily isolate a node (or nodes in a pool) for configuration via an init container, and then making the node available again for general workloads.
+This section outlines a more advanced and automated method for node configuration. The workflow uses a single, intelligent DaemonSet that not only applies the configuration to tainted nodes but also automatically removes the taint from the node once its job is complete. This approach is ideal for streamlining configuration changes across a node pool without manual intervention to make the nodes schedulable again.
 
+The process leverages the kubectl binary available on GKE nodes and requires RBAC permissions for the DaemonSet's ServiceAccount to modify its own node object.
 #### Concept:
+1.  **Taint Node Pool:** A taint is applied to a node pool to prevent regular workloads from being scheduled, effectively reserving it for configuration.
+2.  **Deploy Smart DaemonSet:** A DaemonSet is deployed with three key characteristics:
+    * **Toleration:** It has a `toleration` to allow it to run on the tainted nodes.
+    * **Configuration Logic:** An init container runs privileged commands to configure the node (e.g., setting `sysctl` values).
+    * **Untainting Logic:** After applying the configuration, the same container uses the node's `kubectl` tool to remove the taint from itself, making the node available for general use.
+3.  **Verification:** Once the DaemonSet pod completes its init container, the node is both configured and fully schedulable.
 
-1.  **Taint:** Apply a **`taint`** to a node pool. This prevents regular pods (without matching **`tolerations`**) from being scheduled there, effectively reserving it.
-2.  **Configure:** Deploy a DaemonSet (like the one in Part 1) but add a **`tolerations`** block that specifically matches the taint applied. This ensures the configuration init container *only* runs on the isolated, tainted nodes.
-3.  **Untaint:** Remove the taint from the node pool, allowing any workload (subject to other scheduling rules) to be scheduled on the now-configured nodes.
+---
 
 #### Walkthrough:
 
@@ -149,95 +154,148 @@ This scenario demonstrates using taints to temporarily isolate a node (or nodes 
         ```bash
         kubectl describe node <node-name-in-pool> | grep Taints
         ```
+        You should see node.config/status=initializing:NoSchedule.
 
-2.  **Run Init Container on Tainted Node:**
-    * Create a DaemonSet YAML (`tainted-config-daemonset.yaml`). This is similar to Part 1, but **adds the `tolerations` block**:
+2.  **Create and Deploy the Self-Untainting DaemonSet:**
+    * The following YAML creates all the necessary components: a **ServiceAccount** for permissions, a **ClusterRole** granting node-patching rights, a **ClusterRoleBinding** to link them, and the **DaemonSet** itself.
+    Save the following content as `auto-untaint-daemonset.yaml`.
 
-        ```yaml
-        apiVersion: apps/v1
-        kind: DaemonSet
-        metadata:
-          name: tainted-config-daemonset
-          labels:
-            app: tainted-configurator
-        spec:
-          selector:
-            matchLabels:
-              app: tainted-configurator
-          template:
-            metadata:
-              labels:
-                app: tainted-configurator
-            spec:
-              # *** Add toleration to match the taint ***
-              tolerations:
-              - key: "node.config.status/stage"
-                operator: "Equal"
-                value: "configuring"
-                effect: "NoSchedule"
-              volumes:
-              - name: host-root-fs
-                hostPath:
-                  path: /
-                  type: Directory
-              # Allow access to host PID namespace if needed for specific tools
-              hostPID: true    
-              initContainers:
-              - name: apply-config-on-tainted
-                image: gcr.io/gke-release/debian-base # Small image with shell tools
-                securityContext:
-                  privileged: true # Still needs privilege for host changes
-                volumeMounts:
-                - name: host-root-fs
-                  mountPath: /host
-                command: ["/bin/sh", "-c"]
-                args:
-                - |
-                  echo "Applying configuration on tainted node..."
-                  # Example: Set a different sysctl value
-                  chroot /host sysctl -w vm.max_map_count=262144
-                  echo "Configuration applied."
-                  exit 0 # Ensure successful exit
-              containers:
-              - name: pause-container
-                image: us.gcr.io/gke-release/pause:latest
-        ```
-    * Apply this DaemonSet:
+```
+# WARNING: THIS MAKES YOUR NODES LESS SECURE. This DaemonSet runs as privileged.
+# WARNING: This DaemonSet runs as privileged, which has significant
+# security implications. Only use this on clusters where you have
+# strict controls over what is deployed.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-config-sa
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-patcher-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  # Permissions needed to read and remove a taint from the node.
+  verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-config-binding
+subjects:
+- kind: ServiceAccount
+  name: node-config-sa
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: node-patcher-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: auto-untaint-daemonset
+  labels:
+    app: auto-untaint-configurator
+spec:
+  selector:
+    matchLabels:
+      app: auto-untaint-configurator
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: auto-untaint-configurator
+    spec:
+      serviceAccountName: node-config-sa
+      hostPID: true
+      # Toleration now matches the taint on your node.
+      tolerations:
+      - key: "node.config.status/stage"
+        operator: "Equal"
+        value: "configuring"           
+        effect: "NoSchedule"
+      volumes:
+      - name: host-root-fs
+        hostPath:
+          path: /
+      initContainers:
+      - name: configure-and-untaint
+        image: ubuntu:22.04 # Using a standard container image.
+        securityContext:
+          privileged: true # Required for chroot and sysctl.
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: host-root-fs
+          mountPath: /host
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          # Using explicit error checking for each critical command.
+          
+          # Define the configuration and taint details.
+          SYSCTL_PARAM="vm.max_map_count"
+          SYSCTL_VALUE="262144"
+          TAINT_KEY="node.config.status/stage" 
 
-        ```bash
-        kubectl apply -f tainted-config-daemonset.yaml
-        ```
-    * Verify pods run *only* on the tainted nodes:
+          echo "Running configuration on node: ${NODE_NAME}"
 
-        ```bash
-        kubectl get pods -l app=tainted-configurator -o wide
-        ```
-    * Check logs to confirm configuration:
+          # 1. APPLY CONFIGURATION
+          echo "--> Applying ${SYSCTL_PARAM}=${SYSCTL_VALUE}..."
+          if ! chroot /host sysctl -w "${SYSCTL_PARAM}=${SYSCTL_VALUE}"; then
+            echo "ERROR: Failed to apply sysctl parameter." >&2
+            exit 1
+          fi
+          echo "--> Configuration applied successfully."
 
-        ```bash
-        POD_NAME=$(kubectl get pods -l app=tainted-configurator -o jsonpath='{.items[0].metadata.name}')
-        kubectl logs $POD_NAME -c apply-config-on-tainted
-        ```
-
-3.  **Remove the Taint:**
-    * Once configuration is complete, remove the taint from the node pool to make it generally schedulable.
-        ```bash
-        # Use the --remove-node-taints flag with the exact key/effect pair
-        gcloud container node-pools update $NODE_POOL \
-          --cluster=$GKE_CLUSTER \
-          --node-taints="" \
-          --zone=$GKE_ZONE # Or --region=$GKE_REGION
-        ```
-    * Verify the taint is removed:
-        ```bash
-        kubectl describe node <node-name-in-pool> | grep Taints
-        ```
-        *(The specific taint should no longer be listed).*
-
-    Now, regular deployments (without the specific `node.config.status/stage` toleration) can be scheduled onto the nodes in this pool again.
-
+          # 2. UNTAINT THE NODE
+          # This command removes the taint from the node this pod is running on.
+          echo "--> Untainting node ${NODE_NAME} by removing taint ${TAINT_KEY}..."
+          if ! /host/home/kubernetes/bin/kubectl taint node "${NODE_NAME}" "${TAINT_KEY}:NoSchedule-"; then
+            echo "ERROR: Failed to untaint the node." >&2
+            exit 1
+          fi
+          echo "--> Node has been untainted and is now schedulable."
+      # The main container is minimal; it just keeps the pod running.
+      containers:
+      - name: pause-container
+        image: registry.k8s.io/pause:3.9
+```
 ---
 
+*   **Apply the `DaemonSet` manifest.**
+    ```bash
+    kubectl apply -f auto-untaint-daemonset.yaml
+    ```
+3.  **Validate the DaemonSet:**
+  
+*   **Verify the pods are running on the tainted nodes.**
+    You should see the pod in a `Running` state after the init container completes.
+    ```bash
+    kubectl get pods -l app=auto-untaint-configurator -o wide
+    ```
+
+*   **Check the logs to confirm execution.**
+    View the `initContainer` logs to ensure the script ran and untainted the node successfully.
+    ```bash
+    # Get a pod name from the command above
+    POD_NAME=$(kubectl get pods -l app=auto-untaint-configurator -o jsonpath='{.items[0].metadata.name}')
+
+    # Check the logs for that pod's init container
+    kubectl logs $POD_NAME -c configure-and-untaint
+    ```
+    The output will confirm that the `sysctl` command ran and the node was untainted.
+
+---
 ### Part 3: Privileged DaemonSet Tradeoffs and Security Restrictions
 
 Using `securityContext: privileged: true` in a DaemonSet (or any pod) is powerful but comes with significant security implications. It essentially disables most container isolation boundaries for that pod.
