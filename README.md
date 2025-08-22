@@ -130,14 +130,7 @@ The process leverages the kubectl binary available on GKE nodes and requires RBA
     * **Untainting Logic:** After applying the configuration, the same container uses the node's `kubectl` tool to remove the taint from itself, making the node available for general use.
 3.  **Verification:** Once the DaemonSet pod completes its init container, the node is both configured and fully schedulable.
 
-<<<<<<< HEAD
 ---
-=======
-1.  **Taint:** Apply a **`taint`** to a node pool. This prevents regular pods (without matching **`tolerations`**) from being scheduled there, effectively reserving it.
-2.  **Configure:** Deploy a DaemonSet (like the one in Part 1) but add a **`tolerations`** block that specifically matches the taint applied. This ensures the configuration init container *only* runs on the isolated, tainted nodes.
-3.  **Untaint:** Remove the taint from the indvidual nodes, allowing any workload (subject to other scheduling rules) to be scheduled on the now-configured nodes. The why: The source of truth of taints is at node pool level, meaning when the node pool scales up, or after upgrade, the new nodes always get the taint. This is the desired behavior, to prevent pod scheduling until config is done (and taint is removed).
->>>>>>> master
-
 #### Walkthrough:
 
 1.  **Taint the Node Pool:**
@@ -276,7 +269,7 @@ spec:
       - name: pause-container
         image: registry.k8s.io/pause:3.9
 ```
----
+
 
 *   **Apply the `DaemonSet` manifest.**
     ```bash
